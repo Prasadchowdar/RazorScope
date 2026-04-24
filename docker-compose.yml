@@ -1,0 +1,298 @@
+name: razorscope
+
+networks:
+  razorscope_net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  chdata:
+  kafkadata:
+  prometheus_data:
+  grafana_data:
+
+services:
+  # ─── PostgreSQL ───────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: razorscope-postgres
+    environment:
+      POSTGRES_USER: razorscope
+      POSTGRES_PASSWORD: razorscope_dev
+      POSTGRES_DB: razorscope
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - razorscope_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U razorscope -d razorscope"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─── Redis Stack (includes RedisBloom for BFAdd/BFExists) ─────────────────────
+  redis:
+    image: redis/redis-stack:7.2.0-v11
+    container_name: razorscope-redis
+    ports:
+      - "6379:6379"
+      - "8001:8001"  # RedisInsight UI
+    networks:
+      - razorscope_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─── ClickHouse ───────────────────────────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.4-alpine
+    container_name: razorscope-clickhouse
+    environment:
+      CLICKHOUSE_USER: razorscope
+      CLICKHOUSE_PASSWORD: razorscope_dev
+      CLICKHOUSE_DB: razorscope
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ports:
+      - "8123:8123"  # HTTP interface
+      - "9000:9000"  # Native TCP
+    volumes:
+      - chdata:/var/lib/clickhouse
+    networks:
+      - razorscope_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+
+  # ─── Kafka (KRaft mode — no ZooKeeper) ───────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    container_name: razorscope-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168   # 7 days
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qg==  # Fixed UUID — prevents incompatibility on down -v && up
+    ports:
+      - "9092:9092"
+      - "29092:29092"  # External listener — Go service running on host connects here
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+    networks:
+      - razorscope_net
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+
+  # ─── Kafka Init (one-shot topic creation) ─────────────────────────────────────
+  kafka-init:
+    image: confluentinc/cp-kafka:7.7.1
+    container_name: razorscope-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - razorscope_net
+    entrypoint: ["/bin/sh", "-c", "kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic razorpay.events --partitions 12 --replication-factor 1 --config retention.ms=604800000 && echo 'Topic razorpay.events ready'"]
+    restart: "no"
+
+  # ─── Flyway (one-shot PostgreSQL migrations) ──────────────────────────────────
+  flyway:
+    image: flyway/flyway:10.20.1
+    container_name: razorscope-flyway
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - razorscope_net
+    volumes:
+      - ./migrations/postgres:/flyway/sql:ro
+    environment:
+      FLYWAY_URL: jdbc:postgresql://postgres:5432/razorscope
+      FLYWAY_USER: razorscope
+      FLYWAY_PASSWORD: razorscope_dev
+      FLYWAY_LOCATIONS: filesystem:/flyway/sql
+      FLYWAY_BASELINE_ON_MIGRATE: "true"
+    command: migrate
+    restart: "no"
+
+  # ─── Dashboard API ────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    container_name: razorscope-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+    ports:
+      - "8090:8000"
+    networks:
+      - razorscope_net
+    environment:
+      DATABASE_URL: postgresql://razorscope_app:app_dev_password@postgres:5432/razorscope
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: razorscope
+      CLICKHOUSE_PASSWORD: razorscope_dev
+      CLICKHOUSE_DB: razorscope
+      WEBHOOK_BASE_URL: http://localhost:8080
+      RAZORPAY_SECRET_ENCRYPTION_KEY: razorscope-dev-razorpay-secret
+      LOG_LEVEL: info
+      PORT: 8000
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ─── Metric Worker ────────────────────────────────────────────────────────────
+  metric-worker:
+    build:
+      context: ./services/metric-worker
+      dockerfile: Dockerfile
+    container_name: razorscope-metric-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+    networks:
+      - razorscope_net
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: razorpay.events
+      KAFKA_GROUP_ID: razorscope-metric-workers
+      DATABASE_URL: postgresql://razorscope:razorscope_dev@postgres:5432/razorscope?sslmode=disable
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: 8123
+      CLICKHOUSE_USER: razorscope
+      CLICKHOUSE_PASSWORD: razorscope_dev
+      CLICKHOUSE_DB: razorscope
+      RAZORPAY_SECRET_ENCRYPTION_KEY: razorscope-dev-razorpay-secret
+      LOG_LEVEL: info
+    restart: unless-stopped
+
+  # ─── Webhook Receiver ─────────────────────────────────────────────────────────
+  # ─── Frontend (React dashboard) ──────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./services/frontend
+      dockerfile: Dockerfile
+    container_name: razorscope-frontend
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "3001:80"
+    networks:
+      - razorscope_net
+    environment:
+      VITE_API_BASE: http://localhost:8090
+    restart: unless-stopped
+
+  # ─── Prometheus ───────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.53.4
+    container_name: razorscope-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+    ports:
+      - "9090:9090"
+    networks:
+      - razorscope_net
+    restart: unless-stopped
+
+  # ─── Grafana ──────────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:11.6.1
+    container_name: razorscope-grafana
+    depends_on:
+      - prometheus
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: razorscope_dev
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    networks:
+      - razorscope_net
+    restart: unless-stopped
+
+  # ─── Webhook Receiver ─────────────────────────────────────────────────────────
+  webhook-receiver:
+    build:
+      context: ./services/webhook-receiver
+      dockerfile: Dockerfile
+    container_name: razorscope-webhook-receiver
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    networks:
+      - razorscope_net
+    environment:
+      DATABASE_URL: postgresql://razorscope:razorscope_dev@postgres:5432/razorscope?sslmode=disable
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ""
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: razorpay.events
+      KAFKA_WRITE_TIMEOUT: 2s
+      PORT: 8080
+      TIMESTAMP_TOLERANCE_SEC: 300
+      LOG_LEVEL: info
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped

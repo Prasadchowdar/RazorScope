@@ -1,0 +1,251 @@
+name: razorscope-prod
+
+networks:
+  razorscope_net:
+    driver: bridge
+
+volumes:
+  pgdata:
+  chdata:
+  kafkadata:
+  prometheus_data:
+  grafana_data:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB:       ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - razorscope_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:25.4-alpine
+    environment:
+      CLICKHOUSE_USER:                   ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD:               ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DB:                     ${CLICKHOUSE_DB}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - chdata:/var/lib/clickhouse
+    networks:
+      - razorscope_net
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    restart: unless-stopped
+
+  kafka:
+    image: confluentinc/cp-kafka:7.7.1
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID}
+    volumes:
+      - kafkadata:/var/lib/kafka/data
+    networks:
+      - razorscope_net
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s
+    restart: unless-stopped
+
+  kafka-init:
+    image: confluentinc/cp-kafka:7.7.1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks:
+      - razorscope_net
+    entrypoint: ["/bin/sh", "-c", "kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic razorpay.events --partitions 12 --replication-factor 1 --config retention.ms=604800000 && echo 'Topic razorpay.events ready'"]
+    restart: "no"
+
+  flyway:
+    image: flyway/flyway:10.20.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - razorscope_net
+    volumes:
+      - ./migrations/postgres:/flyway/sql:ro
+    environment:
+      FLYWAY_URL:                  jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      FLYWAY_USER:                 ${POSTGRES_USER}
+      FLYWAY_PASSWORD:             ${POSTGRES_PASSWORD}
+      FLYWAY_LOCATIONS:            filesystem:/flyway/sql
+      FLYWAY_BASELINE_ON_MIGRATE: "true"
+    command: migrate
+    restart: "no"
+
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+    networks:
+      - razorscope_net
+    environment:
+      APP_ENV:                 production
+      DATABASE_URL:            ${DATABASE_URL}
+      CLICKHOUSE_HOST:         ${CLICKHOUSE_HOST}
+      CLICKHOUSE_PORT:         ${CLICKHOUSE_PORT:-8123}
+      CLICKHOUSE_USER:         ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD:     ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DB:           ${CLICKHOUSE_DB}
+      WEBHOOK_BASE_URL:        ${WEBHOOK_BASE_URL}
+      RAZORPAY_SECRET_ENCRYPTION_KEY: ${RAZORPAY_SECRET_ENCRYPTION_KEY}
+      OPENAI_API_KEY:          ${OPENAI_API_KEY}
+      JWT_SECRET_KEY:          ${JWT_SECRET_KEY}
+      REFRESH_COOKIE_SECURE:   "true"
+      CORS_ORIGINS:            ${CORS_ORIGINS}
+      LOG_LEVEL:               info
+      PORT:                    8000
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  metric-worker:
+    build:
+      context: ./services/metric-worker
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+    networks:
+      - razorscope_net
+    environment:
+      KAFKA_BROKERS:       kafka:9092
+      KAFKA_TOPIC:         razorpay.events
+      KAFKA_GROUP_ID:      razorscope-metric-workers
+      DATABASE_URL:        ${DATABASE_URL}
+      CLICKHOUSE_HOST:     ${CLICKHOUSE_HOST}
+      CLICKHOUSE_PORT:     ${CLICKHOUSE_PORT:-8123}
+      CLICKHOUSE_USER:     ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_DB:       ${CLICKHOUSE_DB}
+      RAZORPAY_SECRET_ENCRYPTION_KEY: ${RAZORPAY_SECRET_ENCRYPTION_KEY}
+      LOG_LEVEL:           info
+    restart: unless-stopped
+
+  webhook-receiver:
+    build:
+      context: ./services/webhook-receiver
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      flyway:
+        condition: service_completed_successfully
+    ports:
+      - "8080:8080"
+    networks:
+      - razorscope_net
+    environment:
+      DATABASE_URL:           ${DATABASE_URL}
+      REDIS_ADDR:             redis:6379
+      REDIS_PASSWORD:         ${REDIS_PASSWORD:-}
+      KAFKA_BROKERS:          kafka:9092
+      KAFKA_TOPIC:            razorpay.events
+      KAFKA_WRITE_TIMEOUT:    2s
+      PORT:                   8080
+      TIMESTAMP_TOLERANCE_SEC: 300
+      LOG_LEVEL:              info
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./services/frontend
+      dockerfile: Dockerfile
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "3001:80"
+    networks:
+      - razorscope_net
+    environment:
+      VITE_API_BASE: ${VITE_API_BASE}
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.53.4
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=15d"
+    networks:
+      - razorscope_net
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.6.1
+    depends_on:
+      - prometheus
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      GF_SECURITY_ADMIN_USER:     admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_SECURITY_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+    networks:
+      - razorscope_net
+    restart: unless-stopped

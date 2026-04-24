@@ -1,0 +1,64 @@
+# ─── Binaries ────────────────────────────────────────────────────────────────
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+services/webhook-receiver/webhook-receiver
+
+# ─── Go build cache ──────────────────────────────────────────────────────────
+services/webhook-receiver/vendor/
+
+# ─── Environment / secrets (NEVER commit) ────────────────────────────────────
+.env
+.env.local
+.env.prod
+.env.staging
+**/.env
+**/.env.local
+**/.env.prod
+**/.env.staging
+# Keep .env.example files (they are safe templates)
+!**/.env.example
+!**/.env.production.example
+
+# ─── Local generated assets ──────────────────────────────────────────────────
+node_modules/
+dist/
+*.log
+*.pid
+
+# ─── Docker volumes (never commit data dirs) ─────────────────────────────────
+data/
+
+# ─── IDE ─────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.user
+
+# ─── Local tool state ────────────────────────────────────────────────────────
+.claude/
+
+# ─── OS ──────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+*.pyc
+
+# ─── Terraform (future) ──────────────────────────────────────────────────────
+*.tfstate
+*.tfstate.backup
+.terraform/
+
+# ─── Build artifacts ─────────────────────────────────────────────────────────
+*.tar.gz
+*.zip

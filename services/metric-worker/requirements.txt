@@ -1,0 +1,10 @@
+kafka-python>=2.0.2
+redis>=5.0.0
+psycopg2-binary>=2.9.9
+clickhouse-connect>=0.7.19
+python-dotenv>=1.0.0
+APScheduler>=3.10.4
+
+# Testing
+pytest>=8.0.0
+pytest-mock>=3.12.0

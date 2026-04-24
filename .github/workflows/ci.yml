@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ── Go: webhook-receiver ──────────────────────────────────────────────────────
+  go-build:
+    name: Go build & vet
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/webhook-receiver
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+      - run: go vet ./...
+      - run: go build ./...
+
+  # ── Python: metric-worker ─────────────────────────────────────────────────────
+  metric-worker-tests:
+    name: Metric worker tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/metric-worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: pytest tests/ -q
+
+  # ── TypeScript: frontend ─────────────────────────────────────────────────────
+  frontend-build:
+    name: Frontend type-check & build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: services/frontend/package-lock.json
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run build
+
+  # ── Python: dashboard API ─────────────────────────────────────────────────────
+  api-tests:
+    name: Dashboard API tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: services/api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: pytest tests/ -q
