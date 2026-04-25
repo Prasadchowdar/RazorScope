@@ -207,7 +207,7 @@ class TestAuth:
 
     def test_invalid_api_key_returns_401(self, client):
         app.dependency_overrides.clear()
-        with patch("api.db.postgres.merchant_id_for_api_key", return_value=None):
+        with patch("api.db.postgres.lookup_api_key", return_value=None):
             resp = client.get("/api/v1/mrr/summary?month=2024-01",
                               headers={"X-Api-Key": "bad_key"})
         assert resp.status_code == 401

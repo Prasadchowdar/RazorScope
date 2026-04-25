@@ -57,7 +57,7 @@ class TestRiskScores:
     def test_returns_200_with_scores_list(self, client):
         rows = [_risk_row()]
         with patch.object(ch_db, "subscriber_risk_factors", return_value=rows), \
-             patch.object(ch_db, "subscriber_payment_failures", return_value=0):
+             patch.object(ch_db, "subscriber_payment_failures_batch", return_value={}):
             resp = client.get("/api/v1/subscribers/risk-scores", headers={"X-Api-Key": "any"})
         assert resp.status_code == 200
         body = resp.json()
@@ -69,7 +69,7 @@ class TestRiskScores:
         row = _risk_row(has_contraction_90d=True, tenure_months=15,
                         current_mrr_paise=200000, peak_mrr_paise=500000)
         with patch.object(ch_db, "subscriber_risk_factors", return_value=[row]), \
-             patch.object(ch_db, "subscriber_payment_failures", return_value=3):
+             patch.object(ch_db, "subscriber_payment_failures_batch", return_value={"sub_001": 3}):
             resp = client.get("/api/v1/subscribers/risk-scores", headers={"X-Api-Key": "any"})
         score = resp.json()["scores"][0]
         assert score["risk_label"] == "high"
@@ -80,7 +80,7 @@ class TestRiskScores:
         row = _risk_row(has_contraction_90d=False, tenure_months=6,
                         current_mrr_paise=300000, peak_mrr_paise=310000)
         with patch.object(ch_db, "subscriber_risk_factors", return_value=[row]), \
-             patch.object(ch_db, "subscriber_payment_failures", return_value=0):
+             patch.object(ch_db, "subscriber_payment_failures_batch", return_value={}):
             resp = client.get("/api/v1/subscribers/risk-scores", headers={"X-Api-Key": "any"})
         score = resp.json()["scores"][0]
         assert score["risk_label"] == "low"
@@ -88,7 +88,7 @@ class TestRiskScores:
 
     def test_empty_returns_zero_total(self, client):
         with patch.object(ch_db, "subscriber_risk_factors", return_value=[]), \
-             patch.object(ch_db, "subscriber_payment_failures", return_value=0):
+             patch.object(ch_db, "subscriber_payment_failures_batch", return_value={}):
             resp = client.get("/api/v1/subscribers/risk-scores", headers={"X-Api-Key": "any"})
         body = resp.json()
         assert body["scores"] == []
@@ -96,6 +96,14 @@ class TestRiskScores:
 
     def test_limit_param_accepted(self, client):
         with patch.object(ch_db, "subscriber_risk_factors", return_value=[]) as mock, \
-             patch.object(ch_db, "subscriber_payment_failures", return_value=0):
+             patch.object(ch_db, "subscriber_payment_failures_batch", return_value={}):
             client.get("/api/v1/subscribers/risk-scores?limit=100", headers={"X-Api-Key": "any"})
         mock.assert_called_once_with(MERCHANT, 100)
+
+    def test_batch_failures_query_called_once(self, client):
+        """N+1 fix: regardless of N subscribers, batch should be called exactly once."""
+        rows = [_risk_row(sub_id=f"sub_{i:03d}") for i in range(5)]
+        with patch.object(ch_db, "subscriber_risk_factors", return_value=rows), \
+             patch.object(ch_db, "subscriber_payment_failures_batch", return_value={}) as batch:
+            client.get("/api/v1/subscribers/risk-scores", headers={"X-Api-Key": "any"})
+        assert batch.call_count == 1

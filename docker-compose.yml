@@ -61,6 +61,7 @@ services:
       - "9000:9000"  # Native TCP
     volumes:
       - chdata:/var/lib/clickhouse
+      - ./schema/clickhouse:/docker-entrypoint-initdb.d:ro
     networks:
       - razorscope_net
     healthcheck:

@@ -59,7 +59,7 @@ class TestSegmentsEndpoint:
 
     def test_requires_auth(self, client):
         app.dependency_overrides.clear()
-        with patch("api.db.postgres.merchant_id_for_api_key", return_value=None):
+        with patch("api.db.postgres.lookup_api_key", return_value=None):
             r = client.get("/api/v1/segments", headers={"X-Api-Key": "bad"})
         assert r.status_code == 401
 

@@ -138,6 +138,168 @@ def seed_postgres(merchant_id: str):
     print(f"  Postgres: {inserted} customers inserted")
 
 
+# ─── CRM seed data — gives the Churn Defender real RAG context to retrieve ─────
+# These customers will appear as at-risk in the demo (they have contractions in
+# the MRR data above). Seeding CRM leads + activity notes makes the agentic
+# churn defender's pgvector RAG search return real semantic matches instead of
+# coming up empty.
+CRM_NOTES = {
+    "cust_arjun_001": [
+        ("call",  "Arjun called CSM. Says his team shrunk from 12 to 6 people after Series A funding fell through. Asked if there's a smaller plan. Already downgraded once."),
+        ("email", "Sent pricing breakdown for the starter tier. Arjun replied saying he'll think about it but might switch to a free competitor."),
+        ("note",  "Risk: HIGH. Arjun mentioned competitor 'CompeteCo' offers similar features at 40% less. Strong price sensitivity."),
+    ],
+    "cust_deepa_006": [
+        ("note",  "Deepa's HR platform usage dropped 60% in March. She mentioned hiring freeze due to economic conditions in Singapore."),
+        ("call",  "30-min call with Deepa. Wants to pause subscription for 2 months. Offered her growth plan at starter price for Q2 — she's considering."),
+    ],
+    "cust_pooja_014": [
+        ("email", "Pooja emailed support 3x about UPI autopay failures. Frustrated with payment retries. Recommended switching to card."),
+        ("note",  "Pooja downgraded from Growth to Starter after just 4 months. Onboarding survey scored us 4/10 on 'value for money'."),
+        ("call",  "Pooja's CTO joined the QBR. They're evaluating in-house build. Need to escalate to Solutions Engineering team."),
+    ],
+}
+
+
+def seed_crm(merchant_id: str) -> list[tuple[str, str, str, str]]:
+    """
+    Seed CRM leads + activities. Returns list of (customer_id, lead_id, activity_id, body)
+    so the caller can generate embeddings.
+    """
+    conn = psycopg2.connect(DATABASE_URL)
+    activities_created: list[tuple[str, str, str, str]] = []
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SET LOCAL app.current_merchant_id = %s", (merchant_id,))
+
+            # Ensure default pipeline stages exist
+            cur.execute(
+                "SELECT count(*) AS c FROM pipeline_stages WHERE merchant_id = %s::uuid",
+                (merchant_id,),
+            )
+            if cur.fetchone()["c"] == 0:
+                for idx, (name, color) in enumerate([
+                    ("New",         "#94a3b8"),
+                    ("Qualified",   "#3b82f6"),
+                    ("At Risk",     "#f59e0b"),
+                    ("Won",         "#10b981"),
+                    ("Lost",        "#ef4444"),
+                ]):
+                    cur.execute(
+                        "INSERT INTO pipeline_stages (merchant_id, name, color, position) "
+                        "VALUES (%s::uuid, %s, %s, %s)",
+                        (merchant_id, name, color, idx),
+                    )
+
+            cur.execute(
+                "SELECT id FROM pipeline_stages WHERE merchant_id = %s::uuid "
+                "AND name = 'At Risk' LIMIT 1",
+                (merchant_id,),
+            )
+            stage_row = cur.fetchone()
+            stage_id = str(stage_row["id"]) if stage_row else None
+
+            for razorpay_cust_id, notes in CRM_NOTES.items():
+                # Find the Postgres customer UUID
+                cur.execute(
+                    "SELECT id FROM customers WHERE merchant_id = %s::uuid "
+                    "AND razorpay_customer_id = %s",
+                    (merchant_id, razorpay_cust_id),
+                )
+                cust_row = cur.fetchone()
+                if not cust_row:
+                    continue
+                customer_id = str(cust_row["id"])
+
+                cust_meta = next(c for c in CUSTOMERS if c[0] == razorpay_cust_id)
+                _, name, email, _country, _pm, source = cust_meta
+
+                # Upsert lead linked to this customer
+                cur.execute(
+                    "SELECT id FROM crm_leads WHERE merchant_id = %s::uuid "
+                    "AND customer_id = %s::uuid LIMIT 1",
+                    (merchant_id, customer_id),
+                )
+                lead_row = cur.fetchone()
+                if lead_row:
+                    lead_id = str(lead_row["id"])
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO crm_leads (merchant_id, stage_id, customer_id,
+                            name, email, source, owner)
+                        VALUES (%s::uuid, %s::uuid, %s::uuid, %s, %s, %s, %s)
+                        RETURNING id
+                        """,
+                        (merchant_id, stage_id, customer_id, name, email, source, "demo-csm"),
+                    )
+                    lead_id = str(cur.fetchone()["id"])
+
+                for activity_type, body in notes:
+                    cur.execute(
+                        "INSERT INTO crm_activities (lead_id, merchant_id, type, body) "
+                        "VALUES (%s::uuid, %s::uuid, %s, %s) RETURNING id",
+                        (lead_id, merchant_id, activity_type, body),
+                    )
+                    activity_id = str(cur.fetchone()["id"])
+                    activities_created.append((customer_id, lead_id, activity_id, body))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    print(f"  Postgres CRM: {len(activities_created)} activity notes inserted")
+    return activities_created
+
+
+def seed_embeddings(merchant_id: str, activities: list[tuple[str, str, str, str]]) -> None:
+    """If OPENAI_API_KEY is set, generate + store embeddings so RAG search works."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        print("  Embeddings: skipped (OPENAI_API_KEY not set)")
+        return
+    try:
+        from openai import OpenAI
+    except ImportError:
+        print("  Embeddings: skipped (openai package not installed)")
+        return
+
+    client = OpenAI(api_key=api_key)
+    conn = psycopg2.connect(DATABASE_URL)
+    inserted = 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL app.current_merchant_id = %s", (merchant_id,))
+            for customer_id, _lead_id, activity_id, body in activities:
+                resp = client.embeddings.create(
+                    model="text-embedding-3-small",
+                    input=body[:8000],
+                    encoding_format="float",
+                )
+                vec = resp.data[0].embedding
+                cur.execute(
+                    """
+                    INSERT INTO subscriber_embeddings
+                        (merchant_id, customer_id, source_type, source_id, content_text, embedding)
+                    VALUES (%s::uuid, %s::uuid, %s, %s::uuid, %s, %s::vector)
+                    ON CONFLICT ON CONSTRAINT uq_source DO UPDATE
+                    SET content_text = EXCLUDED.content_text,
+                        embedding    = EXCLUDED.embedding
+                    """,
+                    (merchant_id, customer_id, "activity", activity_id, body, vec),
+                )
+                inserted += 1
+        conn.commit()
+    except Exception as exc:
+        conn.rollback()
+        print(f"  Embeddings: failed — {exc}")
+        return
+    finally:
+        conn.close()
+    print(f"  Embeddings: {inserted} activity embeddings stored (RAG ready)")
+
+
 def seed_clickhouse(merchant_id: str, ch):
     # Check if already seeded (look for our specific sub_ids)
     result = ch.query(
@@ -148,6 +310,32 @@ def seed_clickhouse(merchant_id: str, ch):
     if existing > 0:
         print(f"  ClickHouse: demo data already present — skipping")
         return
+
+    # Seed payment_failed events for at-risk subscribers so the risk-scoring
+    # signal "payment_failures > 1 (+25)" actually fires in the demo.
+    # Each gets 2-3 failures within the last 90 days.
+    pe_cols = [
+        "event_id", "merchant_id", "event_type", "razorpay_sub_id", "razorpay_pay_id",
+        "plan_id", "customer_id", "amount_paise", "currency", "payment_method",
+        "interval_type", "mrr_paise", "source", "event_ts", "received_at", "raw_payload",
+    ]
+    pe_rows = []
+    failure_plan = [
+        ("sub_arjun_001",  "cust_arjun_001",  "plan_starter", STARTER, "card",        3),
+        ("sub_pooja_014",  "cust_pooja_014",  "plan_starter", STARTER, "upi_autopay", 4),
+        ("sub_deepa_006",  "cust_deepa_006",  "plan_starter", STARTER, "card",        2),
+    ]
+    for sub_id, cust_id, plan_id, amount, pmt, n in failure_plan:
+        for i in range(n):
+            ts = datetime(2026, 4, 24 - i*7, 10, 0, 0)
+            pe_rows.append([
+                f"evt_fail_{sub_id}_{i}",
+                merchant_id, "payment_failed", sub_id, f"pay_fail_{sub_id}_{i}",
+                plan_id, cust_id, amount, "INR", pmt,
+                "monthly", amount, "webhook", ts, ts, "{}",
+            ])
+    ch.insert("subscription_events", pe_rows, column_names=pe_cols)
+    print(f"  ClickHouse: {len(pe_rows)} payment_failed events inserted (3 high-risk subscribers)")
 
     # Insert mrr_movements
     mv_cols = [
@@ -179,7 +367,58 @@ def seed_clickhouse(merchant_id: str, ch):
     print(f"  ClickHouse: {len(cr_rows)} cohort retention rows inserted")
 
 
+def embed_existing_only():
+    """
+    Re-runnable: generate embeddings for already-seeded CRM activities.
+    Use this after putting your real OPENAI_API_KEY in .env without
+    re-running the full seed (which is idempotent but slower).
+    Run: docker compose exec api python seed_demo.py --embed-only
+    """
+    pg = psycopg2.connect(DATABASE_URL)
+    with pg.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM merchants WHERE deleted_at IS NULL "
+            "ORDER BY created_at DESC LIMIT 1"
+        )
+        row = cur.fetchone()
+    if not row:
+        print("ERROR: No merchant found.")
+        sys.exit(1)
+    merchant_id = str(row[0])
+
+    with pg.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute("SET LOCAL app.current_merchant_id = %s", (merchant_id,))
+        cur.execute(
+            """
+            SELECT l.customer_id::text AS customer_id, l.id::text AS lead_id,
+                   a.id::text AS activity_id, a.body
+            FROM crm_activities a
+            JOIN crm_leads l ON l.id = a.lead_id
+            WHERE a.merchant_id = %s::uuid AND l.customer_id IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM subscriber_embeddings e
+                  WHERE e.source_id = a.id AND e.source_type = 'activity'
+              )
+            """,
+            (merchant_id,),
+        )
+        rows = cur.fetchall()
+    pg.close()
+
+    if not rows:
+        print("Nothing to embed: every activity already has an embedding.")
+        return
+
+    activities = [(r["customer_id"], r["lead_id"], r["activity_id"], r["body"]) for r in rows]
+    print(f"Embedding {len(activities)} activities for merchant {merchant_id}...")
+    seed_embeddings(merchant_id, activities)
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "--embed-only":
+        embed_existing_only()
+        return
+
     print("Connecting to Postgres...")
     pg = psycopg2.connect(DATABASE_URL)
     with pg.cursor() as cur:
@@ -210,6 +449,12 @@ def main():
 
     print("Seeding ClickHouse analytics...")
     seed_clickhouse(merchant_id, ch)
+
+    print("Seeding CRM leads + activity notes...")
+    activities = seed_crm(merchant_id)
+
+    print("Generating RAG embeddings for activity notes...")
+    seed_embeddings(merchant_id, activities)
 
     print()
     print("Done! Open the AI tab and try:")

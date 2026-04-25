@@ -82,9 +82,11 @@ def subscriber_risk_scores(
     tenure>12m (+20), MRR<50% of peak (+15). No LLM involved.
     """
     rows = clickhouse.subscriber_risk_factors(merchant_id, limit)
+    sub_ids = [r["razorpay_sub_id"] for r in rows]
+    failures_map = clickhouse.subscriber_payment_failures_batch(merchant_id, sub_ids)
     scores: list[RiskScore] = []
     for row in rows:
-        failures = clickhouse.subscriber_payment_failures(merchant_id, row["razorpay_sub_id"])
+        failures = failures_map.get(row["razorpay_sub_id"], 0)
         score, label, factors = _compute_risk(row, failures)
         scores.append(RiskScore(
             razorpay_sub_id=row["razorpay_sub_id"],

@@ -8,5 +8,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY worker/ ./worker/
+COPY tests/ ./tests/
 
 CMD ["python", "-m", "worker.main"]

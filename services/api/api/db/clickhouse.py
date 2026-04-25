@@ -318,6 +318,29 @@ def subscriber_payment_failures(merchant_id: str, sub_id: str, days: int = 90) -
     return int(val) if val else 0
 
 
+def subscriber_payment_failures_batch(
+    merchant_id: str, sub_ids: list[str], days: int = 90
+) -> dict[str, int]:
+    """
+    Batch-count payment failures for many subscribers in a single ClickHouse query.
+    Returns {sub_id: count}. Sub_ids absent from the result map to 0 in callers.
+    Replaces N+1 calls to subscriber_payment_failures.
+    """
+    if not sub_ids:
+        return {}
+    result = _ch().query(
+        "SELECT razorpay_sub_id, count() AS failures "
+        "FROM subscription_events "
+        "WHERE merchant_id = {mid:String} "
+        "  AND razorpay_sub_id IN {sids:Array(String)} "
+        "  AND event_type = 'payment_failed' "
+        "  AND event_ts >= toDate(now()) - toIntervalDay({days:UInt16}) "
+        "GROUP BY razorpay_sub_id",
+        parameters={"mid": merchant_id, "sids": sub_ids, "days": days},
+    )
+    return {row[0]: int(row[1]) for row in result.result_rows}
+
+
 def subscriber_risk_factors(merchant_id: str, limit: int = 50) -> list[dict]:
     """
     Batch-compute churn risk factors for the top N active subscribers.
