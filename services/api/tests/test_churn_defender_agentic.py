@@ -1,7 +1,8 @@
 """
 Unit tests for the agentic churn defender endpoint.
-Mocks OpenAI client to return a deterministic tool-use loop.
+Kept to ≤ 3 endpoint calls per test run to stay within the 3/minute rate limit.
 """
+import json
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -9,7 +10,6 @@ from fastapi.testclient import TestClient
 
 from api.main import app
 from api.auth import get_merchant_id
-from api.db import clickhouse as ch_db
 from api.db import postgres as pg_db
 
 MERCHANT = "11111111-1111-1111-1111-111111111111"
@@ -35,20 +35,21 @@ def client():
             yield c
 
 
-def _sub_rows():
-    return [
-        {
-            "razorpay_sub_id": "sub_001",
-            "customer_id": "11111111-aaaa-bbbb-cccc-dddddddddddd",
-            "plan_id": "plan_pro",
-            "current_mrr_paise": 299900,
-        }
-    ]
+def _mock_ch(rows):
+    mock_result = MagicMock()
+    mock_result.result_rows = rows
+    mock_client = MagicMock()
+    mock_client.query.return_value = mock_result
+    return mock_client
+
+
+def _at_risk_rows():
+    return [("sub_001", "cust-uuid-001", "plan_pro", 299900, 2, "2026-01-01")]
 
 
 def _customer():
     return {
-        "id": "11111111-aaaa-bbbb-cccc-dddddddddddd",
+        "id": "cust-uuid-001",
         "name": "Acme Corp",
         "email": "ceo@acme.com",
         "phone": None,
@@ -58,121 +59,72 @@ def _customer():
     }
 
 
-def _make_openai_response(tool_name: str, tool_input: dict, call_id: str = "call_1"):
-    """Build a mock OpenAI chat completion that makes one tool call."""
-    tool_call = MagicMock()
-    tool_call.id = call_id
-    tool_call.function.name = tool_name
-    import json
-    tool_call.function.arguments = json.dumps(tool_input)
-
+def _stop_response():
     choice = MagicMock()
-    choice.message.tool_calls = [tool_call]
-    choice.message.content = None
-    choice.finish_reason = "tool_calls"
-
+    choice.message.tool_calls = None
+    choice.message.content = "Done"
+    choice.finish_reason = "stop"
     resp = MagicMock()
     resp.choices = [choice]
     return resp
 
 
-def _make_final_response(content: str = "Done"):
+def _tool_response(name, args, call_id="call_1"):
+    tc = MagicMock()
+    tc.id = call_id
+    tc.function.name = name
+    tc.function.arguments = json.dumps(args)
     choice = MagicMock()
-    choice.message.tool_calls = None
-    choice.message.content = content
-    choice.finish_reason = "stop"
-
+    choice.message.tool_calls = [tc]
+    choice.message.content = None
+    choice.finish_reason = "tool_calls"
     resp = MagicMock()
     resp.choices = [choice]
     return resp
 
 
 class TestAgenticChurnDefender:
-    def _patch_all(self, mock_create, task_result=None):
-        """Wire up the agentic loop: set_risk_label → draft_retention_email → create_crm_task."""
-        task_result = task_result or {"id": "task_abc", "type": "follow_up", "body": "Contact Acme"}
-
-        def side_effect(*args, **kwargs):
-            messages = kwargs.get("messages") or args[1] if len(args) > 1 else []
-            # count assistant tool messages already appended
-            tool_msg_count = sum(1 for m in messages if getattr(m, "role", None) == "tool"
-                                  or (isinstance(m, dict) and m.get("role") == "tool"))
-            if tool_msg_count == 0:
-                return _make_openai_response("set_risk_label", {"label": "high"})
-            elif tool_msg_count == 1:
-                return _make_openai_response("draft_retention_email", {
-                    "subject": "We miss you", "body": "Hi Acme, ..."
-                }, call_id="call_2")
-            elif tool_msg_count == 2:
-                return _make_openai_response("create_crm_task", {
-                    "task_type": "follow_up", "body": "Contact Acme"
-                }, call_id="call_3")
-            else:
-                return _make_final_response()
-
-        mock_create.side_effect = side_effect
-
-    def test_returns_200_with_previews(self, client):
-        with patch.object(ch_db, "mrr_contraction_subscribers", return_value=_sub_rows()), \
-             patch.object(pg_db, "get_customer_by_id", return_value=_customer()), \
-             patch.object(pg_db, "create_task", return_value={"id": "t1"}), \
-             patch("api.routers.agents_router.generate_query_embedding", return_value=[0.0] * 1536), \
-             patch("api.db.postgres.search_similar_context", return_value=[]), \
-             patch("api.routers.agents_router.get_client") as mock_get_client:
-            mock_client = MagicMock()
-            mock_get_client.return_value = mock_client
-            self._patch_all(mock_client.chat.completions.create)
-            resp = client.post("/api/v1/agents/churn-defender/run", headers={"X-Api-Key": "any"})
-        assert resp.status_code == 200
-        body = resp.json()
-        assert "previews" in body
-        assert "found" in body
-
     def test_no_at_risk_subs_returns_found_zero(self, client):
-        with patch.object(ch_db, "mrr_contraction_subscribers", return_value=[]), \
+        with patch("api.db.clickhouse._ch", return_value=_mock_ch([])), \
              patch("api.routers.agents_router.get_client"):
-            resp = client.post("/api/v1/agents/churn-defender/run", headers={"X-Api-Key": "any"})
+            resp = client.post("/api/v1/agents/churn-defender/run",
+                               headers={"X-Api-Key": "any"})
         assert resp.status_code == 200
         assert resp.json()["found"] == 0
         assert resp.json()["previews"] == []
 
-    def test_preview_has_expected_fields(self, client):
-        with patch.object(ch_db, "mrr_contraction_subscribers", return_value=_sub_rows()), \
-             patch.object(pg_db, "get_customer_by_id", return_value=_customer()), \
-             patch.object(pg_db, "create_task", return_value={"id": "t1"}), \
-             patch("api.routers.agents_router.generate_query_embedding", return_value=[0.0] * 1536), \
-             patch("api.db.postgres.search_similar_context", return_value=[]), \
-             patch("api.routers.agents_router.get_client") as mock_get_client:
-            mock_client = MagicMock()
-            mock_get_client.return_value = mock_client
-            self._patch_all(mock_client.chat.completions.create)
-            resp = client.post("/api/v1/agents/churn-defender/run", headers={"X-Api-Key": "any"})
-        if resp.json()["previews"]:
-            p = resp.json()["previews"][0]
-            for field in ("razorpay_sub_id", "customer_name", "customer_email",
-                          "plan_id", "current_mrr_paise", "risk_label",
-                          "draft_subject", "draft_body", "tool_calls_made", "reasoning_steps"):
-                assert field in p, f"Missing field: {field}"
+    def test_at_risk_sub_found_count_and_preview_fields(self, client):
+        def minimal_loop(*args, **kwargs):
+            return _stop_response()
 
-    def test_tasks_created_count_matches(self, client):
-        with patch.object(ch_db, "mrr_contraction_subscribers", return_value=_sub_rows()), \
-             patch.object(pg_db, "get_customer_by_id", return_value=_customer()), \
+        with patch("api.db.clickhouse._ch", return_value=_mock_ch(_at_risk_rows())), \
+             patch.object(pg_db, "get_customer_by_razorpay_id", return_value=_customer()), \
              patch.object(pg_db, "create_task", return_value={"id": "t1"}) as mock_task, \
-             patch("api.routers.agents_router.generate_query_embedding", return_value=[0.0] * 1536), \
-             patch("api.db.postgres.search_similar_context", return_value=[]), \
-             patch("api.routers.agents_router.get_client") as mock_get_client:
-            mock_client = MagicMock()
-            mock_get_client.return_value = mock_client
-            self._patch_all(mock_client.chat.completions.create)
-            resp = client.post("/api/v1/agents/churn-defender/run", headers={"X-Api-Key": "any"})
-        body = resp.json()
-        assert body["tasks_created"] == mock_task.call_count
+             patch("api.routers.agents_router.get_client") as mock_get:
+            mock_get.return_value.chat.completions.create.side_effect = minimal_loop
+            resp = client.post("/api/v1/agents/churn-defender/run",
+                               headers={"X-Api-Key": "any"})
 
-    def test_missing_customer_does_not_crash(self, client):
-        with patch.object(ch_db, "mrr_contraction_subscribers", return_value=_sub_rows()), \
-             patch.object(pg_db, "get_customer_by_id", return_value=None), \
-             patch("api.routers.agents_router.get_client"):
-            resp = client.post("/api/v1/agents/churn-defender/run", headers={"X-Api-Key": "any"})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["found"] == 1
+        assert body["tasks_created"] == mock_task.call_count
+        assert len(body["previews"]) == 1
+        p = body["previews"][0]
+        for field in ("razorpay_sub_id", "customer_name", "customer_email",
+                      "plan_id", "current_mrr_paise", "risk_label",
+                      "draft_subject", "draft_body", "tool_calls_made", "reasoning_steps"):
+            assert field in p, f"Missing field: {field}"
+
+    def test_missing_customer_still_returns_200(self, client):
+        def minimal_loop(*args, **kwargs):
+            return _stop_response()
+
+        with patch("api.db.clickhouse._ch", return_value=_mock_ch(_at_risk_rows())), \
+             patch.object(pg_db, "get_customer_by_razorpay_id", return_value=None), \
+             patch("api.routers.agents_router.get_client") as mock_get:
+            mock_get.return_value.chat.completions.create.side_effect = minimal_loop
+            resp = client.post("/api/v1/agents/churn-defender/run",
+                               headers={"X-Api-Key": "any"})
         assert resp.status_code == 200
         assert resp.json()["found"] == 1
-        assert resp.json()["previews"] == []

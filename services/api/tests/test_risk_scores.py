@@ -98,4 +98,4 @@ class TestRiskScores:
         with patch.object(ch_db, "subscriber_risk_factors", return_value=[]) as mock, \
              patch.object(ch_db, "subscriber_payment_failures", return_value=0):
             client.get("/api/v1/subscribers/risk-scores?limit=100", headers={"X-Api-Key": "any"})
-        mock.assert_called_once_with(MERCHANT, limit=100)
+        mock.assert_called_once_with(MERCHANT, 100)
