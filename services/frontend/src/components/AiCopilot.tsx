@@ -5,10 +5,11 @@ import {
   runChurnDefender,
   generateMonthlyBrief,
   type QueryResponse,
-  type ChurnDefenderResponse,
-  type ChurnPreview,
+  type AgenticChurnDefenderResponse,
+  type AgenticChurnPreview,
 } from "../api/agents";
 import { useAuth } from "../context/AuthContext";
+import RiskBadge from "./RiskBadge";
 
 const inputCls = "w-full rounded-lg px-3 py-2 text-sm bg-[var(--bg-0)] border border-[var(--border-default)] text-[var(--text-primary)] placeholder:text-[var(--text-muted)] focus:outline-none focus:ring-1 focus:ring-[var(--brand)] focus:border-[var(--brand)] transition-colors";
 
@@ -147,7 +148,7 @@ function CopilotCard() {
 function ChurnDefenderCard() {
   const { accessToken } = useAuth();
   const [loading, setLoading] = useState(false);
-  const [result, setResult] = useState<ChurnDefenderResponse | null>(null);
+  const [result, setResult] = useState<AgenticChurnDefenderResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
 
@@ -173,8 +174,8 @@ function ChurnDefenderCard() {
         <div>
           <h3 className="text-sm font-semibold text-[var(--text-primary)]">Churn Defender</h3>
           <p className="text-xs text-[var(--text-muted)] mt-0.5">
-            Finds at-risk subscribers (recent downgrades), drafts a personalized retention
-            email for each, and creates a CRM task — replacing your weekly CSM review.
+            Multi-step AI agent: scores at-risk subscribers, retrieves CRM context, drafts
+            personalized retention emails, and creates CRM tasks — replacing your weekly CSM review.
           </p>
         </div>
         <button
@@ -231,7 +232,7 @@ function ChurnPreviewCard({
   isExpanded,
   onToggle,
 }: {
-  preview: ChurnPreview;
+  preview: AgenticChurnPreview;
   isExpanded: boolean;
   onToggle: () => void;
 }) {
@@ -252,10 +253,12 @@ function ChurnPreviewCard({
       >
         <div className="flex items-center gap-3">
           <div>
-            <p className="text-sm font-medium text-[var(--text-primary)]">{preview.customer_name}</p>
+            <div className="flex items-center gap-2">
+              <p className="text-sm font-medium text-[var(--text-primary)]">{preview.customer_name}</p>
+              <RiskBadge score={0} label={preview.risk_label as "high" | "medium" | "low"} />
+            </div>
             <p className="text-xs text-[var(--text-muted)]">
-              {preview.plan_id} · {paise(preview.current_mrr_paise)}/mo ·{" "}
-              {preview.contraction_count} downgrade{preview.contraction_count !== 1 ? "s" : ""}
+              {preview.plan_id} · {paise(preview.current_mrr_paise)}/mo · {preview.tool_calls_made} tool calls
             </p>
           </div>
         </div>
@@ -263,14 +266,40 @@ function ChurnPreviewCard({
       </button>
 
       {isExpanded && (
-        <div className="border-t border-[var(--border-subtle)] bg-[var(--bg-1)] px-4 py-3 space-y-2">
-          <p className="text-xs font-semibold text-[var(--text-secondary)]">Subject: {preview.draft_subject}</p>
-          <p className="text-xs text-[var(--text-secondary)] whitespace-pre-wrap">{preview.draft_body}</p>
+        <div className="border-t border-[var(--border-subtle)] bg-[var(--bg-1)] px-4 py-3 space-y-3">
+          {preview.draft_subject ? (
+            <>
+              <p className="text-xs font-semibold text-[var(--text-secondary)]">Subject: {preview.draft_subject}</p>
+              <p className="text-xs text-[var(--text-secondary)] whitespace-pre-wrap">{preview.draft_body}</p>
+            </>
+          ) : (
+            <p className="text-xs text-[var(--text-muted)] italic">No email draft generated.</p>
+          )}
+
+          {preview.reasoning_steps.length > 0 && (
+            <details className="text-xs">
+              <summary className="cursor-pointer text-[var(--text-muted)] hover:text-[var(--text-secondary)] transition-colors">
+                {preview.tool_calls_made} tool calls · View reasoning trace
+              </summary>
+              <ol className="mt-2 space-y-1.5 pl-4 list-decimal">
+                {preview.reasoning_steps.map((step, i) => (
+                  <li key={i} className="text-[var(--text-muted)]">
+                    <span className="font-mono text-[var(--brand-2)]">{step.tool_name}</span>
+                    <pre className="mt-0.5 overflow-x-auto rounded bg-[var(--bg-0)] px-2 py-1 text-[10px] text-[var(--text-muted)] leading-relaxed">
+                      {JSON.stringify(step.tool_input, null, 2)}
+                    </pre>
+                  </li>
+                ))}
+              </ol>
+            </details>
+          )}
+
           <div className="flex justify-end">
             <button
               type="button"
               onClick={handleCopy}
-              className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs transition-colors ${
+              disabled={!preview.draft_subject}
+              className={`flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs transition-colors disabled:opacity-40 ${
                 copied
                   ? "border-[rgba(52,211,153,0.3)] bg-[var(--positive-dim)] text-[var(--positive)]"
                   : "border-[var(--border-default)] text-[var(--text-secondary)] hover:border-[var(--border-strong)] hover:text-[var(--text-primary)]"

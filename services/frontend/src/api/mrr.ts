@@ -68,3 +68,23 @@ export async function fetchMovements(
   const { data } = await createBearerClient(token).get("/api/v1/mrr/movements", { params });
   return data;
 }
+
+export interface ForecastMonth {
+  month: string;
+  closing_mrr_paise: number;
+  net_new_mrr_paise: number;
+  is_forecast: true;
+  confidence_low: number;
+  confidence_high: number;
+}
+
+export async function fetchForecast(
+  token: string,
+  monthsHistory = 6,
+  monthsAhead = 3,
+): Promise<{ forecasted_months: ForecastMonth[]; warning?: string }> {
+  const { data } = await createBearerClient(token).get("/api/v1/mrr/forecast", {
+    params: { months_history: monthsHistory, months_ahead: monthsAhead },
+  });
+  return data;
+}

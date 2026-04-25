@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { fetchSummary, fetchTrend, fetchMovements } from "../api/mrr";
+import { fetchSummary, fetchTrend, fetchMovements, fetchForecast } from "../api/mrr";
 import { useAuth } from "../context/AuthContext";
 import type { SegmentFilters } from "../api/types";
 
@@ -30,5 +30,15 @@ export function useMovements(month?: string, page = 1, filters?: SegmentFilters)
     queryFn: () => fetchMovements(accessToken!, month, page, 50, filters),
     enabled: !!accessToken,
     staleTime: 60_000,
+  });
+}
+
+export function useForecast(monthsHistory = 6, monthsAhead = 3) {
+  const { accessToken } = useAuth();
+  return useQuery({
+    queryKey: ["mrr-forecast", monthsHistory, monthsAhead],
+    queryFn: () => fetchForecast(accessToken!, monthsHistory, monthsAhead),
+    enabled: !!accessToken,
+    staleTime: 300_000,
   });
 }

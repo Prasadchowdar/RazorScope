@@ -23,7 +23,7 @@ import { useBenchmarks } from "../hooks/useBenchmarks";
 import { useCohort } from "../hooks/useCohort";
 import { useLead, usePipeline } from "../hooks/useCrm";
 import { useOverview, usePlans } from "../hooks/useMetrics";
-import { useMovements, useSummary, useTrend } from "../hooks/useMrr";
+import { useMovements, useSummary, useTrend, useForecast } from "../hooks/useMrr";
 import { useSegments } from "../hooks/useSegments";
 import { useAuth } from "../context/AuthContext";
 import type { SegmentFilters } from "../api/types";
@@ -73,6 +73,7 @@ export default function Dashboard() {
   const segments = useSegments();
   const summary = useSummary(month, filters);
   const trend = useTrend(12, filters);
+  const forecast = useForecast();
   const movements = useMovements(month, page, filters);
   const cohort = useCohort(24);
   const overview = useOverview(month, filters);
@@ -228,7 +229,7 @@ export default function Dashboard() {
               {trend.isPending
                 ? <Skeleton className="h-72" />
                 : trend.data
-                  ? <MrrChart data={trend.data} />
+                  ? <MrrChart data={trend.data} forecast={forecast.data?.forecasted_months} />
                   : null}
 
               {movements.data && (

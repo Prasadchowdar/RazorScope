@@ -8,12 +8,14 @@ import {
   Legend,
   ResponsiveContainer,
   ReferenceLine,
+  Cell,
 } from "recharts";
-import type { TrendMonth } from "../api/mrr";
+import type { TrendMonth, ForecastMonth } from "../api/mrr";
 import ChartTooltip from "./ChartTooltip";
 
 interface Props {
   data: TrendMonth[];
+  forecast?: ForecastMonth[];
 }
 
 const MOVEMENT_COLORS: Record<string, string> = {
@@ -34,8 +36,8 @@ function fmtAxis(v: number) {
   return `₹${v}`;
 }
 
-export default function MrrChart({ data }: Props) {
-  const chartData = data.map((m) => ({
+export default function MrrChart({ data, forecast }: Props) {
+  const actualData = data.map((m) => ({
     month: m.month,
     new:          toRupees(m.movements.new ?? 0),
     expansion:    toRupees(m.movements.expansion ?? 0),
@@ -43,7 +45,19 @@ export default function MrrChart({ data }: Props) {
     contraction:  toRupees(m.movements.contraction ?? 0),
     churn:        toRupees(m.movements.churn ?? 0),
     closing:      toRupees(m.closing_mrr_paise),
+    isForecast:   false,
   }));
+
+  const forecastData = (forecast ?? []).map((m) => ({
+    month: m.month,
+    new: 0, expansion: 0, reactivation: 0, contraction: 0, churn: 0,
+    closing: toRupees(m.closing_mrr_paise),
+    net_new_forecast: toRupees(m.net_new_mrr_paise),
+    isForecast: true,
+  }));
+
+  const chartData = [...actualData, ...forecastData];
+  const forecastBoundary = forecastData.length > 0 ? forecastData[0].month : null;
 
   return (
     <div
@@ -54,9 +68,16 @@ export default function MrrChart({ data }: Props) {
         <h2 className="text-sm font-semibold" style={{ color: "var(--text-primary)" }}>
           MRR Movements
         </h2>
-        <span className="text-xs" style={{ color: "var(--text-muted)" }}>
-          12-month trend
-        </span>
+        <div className="flex items-center gap-3">
+          {forecastData.length > 0 && (
+            <span className="text-xs px-2 py-0.5 rounded-full" style={{ background: "rgba(52,211,153,0.12)", color: "#34d399" }}>
+              +{forecastData.length}mo forecast
+            </span>
+          )}
+          <span className="text-xs" style={{ color: "var(--text-muted)" }}>
+            12-month trend
+          </span>
+        </div>
       </div>
 
       <ResponsiveContainer width="100%" height={300}>
@@ -83,6 +104,14 @@ export default function MrrChart({ data }: Props) {
             wrapperStyle={{ fontSize: 11, color: "#64748b", paddingTop: 12 }}
           />
           <ReferenceLine y={0} stroke="rgba(255,255,255,0.15)" strokeDasharray="3 3" />
+          {forecastBoundary && (
+            <ReferenceLine
+              x={forecastBoundary}
+              stroke="rgba(52,211,153,0.4)"
+              strokeDasharray="4 2"
+              label={{ value: "Forecast", fill: "#34d399", fontSize: 10, position: "insideTopRight" }}
+            />
+          )}
           {Object.entries(MOVEMENT_COLORS).map(([key, color], i) => (
             <Bar
               key={key}
@@ -93,8 +122,25 @@ export default function MrrChart({ data }: Props) {
               animationBegin={i * 80}
               animationDuration={500}
               animationEasing="ease-out"
-            />
+            >
+              {chartData.map((entry, idx) => (
+                <Cell
+                  key={idx}
+                  fill={color}
+                  fillOpacity={entry.isForecast ? 0 : 1}
+                />
+              ))}
+            </Bar>
           ))}
+          <Bar
+            dataKey="net_new_forecast"
+            stackId="movements"
+            fill="#34d399"
+            fillOpacity={0.35}
+            name="forecast"
+            strokeDasharray="4 2"
+            animationDuration={500}
+          />
         </BarChart>
       </ResponsiveContainer>
     </div>

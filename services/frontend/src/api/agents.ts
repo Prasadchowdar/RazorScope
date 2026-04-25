@@ -7,21 +7,29 @@ export interface QueryResponse {
   summary: string;
 }
 
-export interface ChurnPreview {
+export interface ToolCallStep {
+  tool_name: string;
+  tool_input: Record<string, unknown>;
+  tool_output: unknown;
+}
+
+export interface AgenticChurnPreview {
   razorpay_sub_id: string;
   customer_name: string;
   customer_email: string;
   plan_id: string;
   current_mrr_paise: number;
-  contraction_count: number;
+  risk_label: string;
   draft_subject: string;
   draft_body: string;
+  tool_calls_made: number;
+  reasoning_steps: ToolCallStep[];
 }
 
-export interface ChurnDefenderResponse {
+export interface AgenticChurnDefenderResponse {
   found: number;
   tasks_created: number;
-  previews: ChurnPreview[];
+  previews: AgenticChurnPreview[];
 }
 
 export interface MonthlyBriefResponse {
@@ -34,7 +42,7 @@ export async function queryAnalytics(token: string, question: string): Promise<Q
   return data;
 }
 
-export async function runChurnDefender(token: string): Promise<ChurnDefenderResponse> {
+export async function runChurnDefender(token: string): Promise<AgenticChurnDefenderResponse> {
   const { data } = await createBearerClient(token).post("/api/v1/agents/churn-defender/run");
   return data;
 }

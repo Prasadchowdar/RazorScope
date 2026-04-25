@@ -1124,6 +1124,111 @@ def get_rep_stats(merchant_id: str) -> list[dict]:
     ]
 
 
+# ── RAG / Embeddings ──────────────────────────────────────────────────────────
+
+def list_recent_activities_for_customer(
+    merchant_id: str, customer_id: str, limit: int = 3
+) -> list[dict]:
+    """Last N CRM activity notes for a customer (via their linked CRM leads)."""
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SET LOCAL app.current_merchant_id = %s", (merchant_id,))
+            cur.execute(
+                """
+                SELECT a.id::text, a.type, a.body, a.created_at
+                FROM crm_activities a
+                WHERE a.merchant_id = %s::uuid
+                  AND a.lead_id IN (
+                      SELECT id FROM crm_leads
+                      WHERE merchant_id = %s::uuid AND customer_id = %s::uuid
+                  )
+                ORDER BY a.created_at DESC
+                LIMIT %s
+                """,
+                (merchant_id, merchant_id, customer_id, limit),
+            )
+            rows = cur.fetchall()
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _put_conn(conn)
+    result = []
+    for r in rows:
+        d = dict(r)
+        if d.get("created_at") and hasattr(d["created_at"], "isoformat"):
+            d["created_at"] = d["created_at"].isoformat()
+        result.append(d)
+    return result
+
+
+def upsert_embedding(
+    merchant_id: str,
+    customer_id: str,
+    source_type: str,
+    source_id: str,
+    content_text: str,
+    embedding: list,
+) -> None:
+    """Store or update a vector embedding for a CRM activity note."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET LOCAL app.current_merchant_id = %s", (merchant_id,))
+            cur.execute(
+                """
+                INSERT INTO subscriber_embeddings
+                    (merchant_id, customer_id, source_type, source_id, content_text, embedding)
+                VALUES (%s::uuid, %s::uuid, %s, %s::uuid, %s, %s::vector)
+                ON CONFLICT ON CONSTRAINT uq_source
+                DO UPDATE SET
+                    content_text = EXCLUDED.content_text,
+                    embedding    = EXCLUDED.embedding
+                """,
+                (merchant_id, customer_id, source_type, source_id, content_text, embedding),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _put_conn(conn)
+
+
+def search_similar_context(
+    merchant_id: str,
+    customer_id: str,
+    query_embedding: list,
+    limit: int = 5,
+) -> list[dict]:
+    """ANN cosine similarity search over subscriber embeddings for a given customer."""
+    conn = _get_conn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("SET LOCAL app.current_merchant_id = %s", (merchant_id,))
+            cur.execute(
+                """
+                SELECT content_text, source_type, source_id::text,
+                       1 - (embedding <=> %s::vector) AS similarity
+                FROM subscriber_embeddings
+                WHERE merchant_id = %s::uuid AND customer_id = %s::uuid
+                ORDER BY embedding <=> %s::vector ASC
+                LIMIT %s
+                """,
+                (query_embedding, merchant_id, customer_id, query_embedding, limit),
+            )
+            rows = cur.fetchall()
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        _put_conn(conn)
+    return [dict(r) for r in rows]
+
+
 # ── Lead Enrichment (mock) ─────────────────────────────────────────────────────
 
 _INDUSTRIES = ["SaaS", "FinTech", "HealthTech", "EdTech", "E-Commerce", "Logistics", "HR Tech", "Dev Tools"]

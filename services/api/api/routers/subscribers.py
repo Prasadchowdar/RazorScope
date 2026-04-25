@@ -15,11 +15,44 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 
+from pydantic import BaseModel
+
 from api.auth import get_merchant_id
-from api.db import clickhouse
+from api.db import clickhouse, postgres
 from api.limiter import limiter
 
 router = APIRouter(prefix="/api/v1")
+
+
+class RiskScore(BaseModel):
+    razorpay_sub_id: str
+    customer_id: str
+    plan_id: str
+    risk_score: int
+    risk_label: str
+    factors: list[str]
+
+
+def _compute_risk(row: dict, failure_count: int) -> tuple[int, str, list[str]]:
+    score = 0
+    factors: list[str] = []
+    if row["has_contraction_90d"]:
+        score += 40
+        factors.append("contraction_in_90d")
+    if failure_count > 1:
+        score += 25
+        factors.append("payment_failures_gt1")
+    if row["tenure_months"] > 12:
+        score += 20
+        factors.append("tenure_over_12m")
+    peak = row["peak_mrr_paise"]
+    current = row["current_mrr_paise"]
+    if peak > 0 and current < peak * 0.5:
+        score += 15
+        factors.append("mrr_below_50pct_peak")
+    score = min(score, 100)
+    label = "high" if score >= 65 else ("medium" if score >= 35 else "low")
+    return score, label, factors
 
 
 def _parse_month(s: str) -> date:
@@ -34,6 +67,35 @@ def _parse_month(s: str) -> date:
 def _current_month_str() -> str:
     today = date.today()
     return f"{today.year}-{today.month:02d}"
+
+
+@router.get("/subscribers/risk-scores")
+@limiter.limit("30/minute")
+def subscriber_risk_scores(
+    request: Request,
+    merchant_id: Annotated[str, Depends(get_merchant_id)],
+    limit: int = Query(default=50, ge=1, le=200),
+):
+    """
+    Compute a churn risk score (0-100) for the top N active subscribers.
+    Deterministic formula: contraction_90d (+40), payment_failures>1 (+25),
+    tenure>12m (+20), MRR<50% of peak (+15). No LLM involved.
+    """
+    rows = clickhouse.subscriber_risk_factors(merchant_id, limit)
+    scores: list[RiskScore] = []
+    for row in rows:
+        failures = clickhouse.subscriber_payment_failures(merchant_id, row["razorpay_sub_id"])
+        score, label, factors = _compute_risk(row, failures)
+        scores.append(RiskScore(
+            razorpay_sub_id=row["razorpay_sub_id"],
+            customer_id=str(row["customer_id"]),
+            plan_id=str(row["plan_id"]),
+            risk_score=score,
+            risk_label=label,
+            factors=factors,
+        ))
+    scores.sort(key=lambda s: s.risk_score, reverse=True)
+    return {"scores": [s.model_dump() for s in scores], "total": len(scores)}
 
 
 @router.get("/subscribers/{sub_id}")

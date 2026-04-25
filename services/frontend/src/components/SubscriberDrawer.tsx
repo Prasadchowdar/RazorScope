@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { X } from "lucide-react";
-import type { SubscriberDetail } from "../api/subscribers";
-import { fetchSubscriber } from "../api/subscribers";
+import type { SubscriberDetail, RiskScore } from "../api/subscribers";
+import { fetchSubscriber, fetchRiskScores } from "../api/subscribers";
 import Badge from "./Badge";
+import RiskBadge from "./RiskBadge";
 import { useAuth } from "../context/AuthContext";
 
 type BadgeVariant = "positive" | "negative" | "warning" | "brand" | "neutral";
@@ -30,16 +31,21 @@ export default function SubscriberDrawer({ subId, onClose }: Props) {
   const [detail, setDetail] = useState<SubscriberDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [riskScore, setRiskScore] = useState<RiskScore | null>(null);
 
   useEffect(() => {
     if (!subId || !accessToken) return;
     setDetail(null);
     setError(null);
+    setRiskScore(null);
     setLoading(true);
     fetchSubscriber(accessToken, subId)
       .then(setDetail)
       .catch(() => setError("Failed to load subscriber details."))
       .finally(() => setLoading(false));
+    fetchRiskScores(accessToken, 200)
+      .then(({ scores }) => setRiskScore(scores.find((s) => s.razorpay_sub_id === subId) ?? null))
+      .catch(() => {});
   }, [accessToken, subId]);
 
   if (!subId) return null;
@@ -55,7 +61,10 @@ export default function SubscriberDrawer({ subId, onClose }: Props) {
         {/* Header */}
         <div className="flex items-center justify-between px-6 py-4 border-b border-[var(--border-subtle)]">
           <div>
-            <p className="text-xs font-mono text-[var(--brand-2)]">{subId}</p>
+            <div className="flex items-center gap-2">
+              <p className="text-xs font-mono text-[var(--brand-2)]">{subId}</p>
+              {riskScore && <RiskBadge score={riskScore.risk_score} label={riskScore.risk_label} showScore />}
+            </div>
             {detail && (
               <p className="text-xs text-[var(--text-muted)] mt-0.5">
                 {detail.customer_id} · {detail.plan_id}
@@ -85,6 +94,23 @@ export default function SubscriberDrawer({ subId, onClose }: Props) {
           )}
           {detail && (
             <>
+              {/* Risk factors */}
+              {riskScore && riskScore.factors.length > 0 && (
+                <div className="mb-5 p-4 rounded-xl bg-[var(--bg-2)] border border-[var(--border-subtle)]">
+                  <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--text-muted)] mb-2">
+                    Risk Factors
+                  </p>
+                  <ul className="space-y-1">
+                    {riskScore.factors.map((f) => (
+                      <li key={f} className="text-xs text-[var(--negative)] flex items-center gap-1.5">
+                        <span className="w-1 h-1 rounded-full bg-[var(--negative)] shrink-0" />
+                        {f.replace(/_/g, " ")}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
               {/* Current MRR */}
               <div className="mb-5 p-4 rounded-xl bg-[var(--bg-2)] border border-[var(--border-subtle)]">
                 <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-[var(--text-muted)]">

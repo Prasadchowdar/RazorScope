@@ -19,6 +19,7 @@ from api.routers import (
     benchmarks,
     cohort,
     crm,
+    forecast,
     health,
     integrations,
     metrics,
@@ -63,6 +64,7 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.include_router(health.router)
 app.include_router(mrr.router)
+app.include_router(forecast.router)
 app.include_router(cohort.router)
 app.include_router(metrics.router)
 app.include_router(benchmarks.router)

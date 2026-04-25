@@ -300,3 +300,88 @@ def mrr_movement_rows_all(
     cols = ["razorpay_sub_id", "customer_id", "plan_id", "movement_type",
             "amount_paise", "prev_amount_paise", "delta_paise", "voluntary", "period_month"]
     return [dict(zip(cols, row)) for row in result.result_rows]
+
+
+# ── AI / Risk features ────────────────────────────────────────────────────────
+
+def subscriber_payment_failures(merchant_id: str, sub_id: str, days: int = 90) -> int:
+    """Count payment failure events for a subscriber in the last N days."""
+    result = _ch().query(
+        "SELECT count() FROM subscription_events "
+        "WHERE merchant_id = {mid:String} "
+        "  AND razorpay_sub_id = {sid:String} "
+        "  AND event_type = 'payment_failed' "
+        "  AND event_ts >= toDate(now()) - toIntervalDay({days:UInt16})",
+        parameters={"mid": merchant_id, "sid": sub_id, "days": days},
+    )
+    val = result.first_row[0]
+    return int(val) if val else 0
+
+
+def subscriber_risk_factors(merchant_id: str, limit: int = 50) -> list[dict]:
+    """
+    Batch-compute churn risk factors for the top N active subscribers.
+    Returns per-subscriber: has_contraction_90d, tenure_months, current_mrr_paise, peak_mrr_paise.
+    """
+    cutoff_days = 90
+    result = _ch().query(
+        "SELECT "
+        "    razorpay_sub_id, "
+        "    argMax(customer_id, period_month)  AS customer_id, "
+        "    argMax(plan_id, period_month)       AS plan_id, "
+        "    argMax(amount_paise, period_month)  AS current_mrr_paise, "
+        "    max(amount_paise)                   AS peak_mrr_paise, "
+        "    dateDiff('month', min(period_month), today()) AS tenure_months, "
+        "    countIf("
+        "        movement_type = 'contraction' "
+        "        AND period_month >= toDate(now()) - toIntervalDay({cutoff:UInt16})"
+        "    ) > 0 AS has_contraction_90d "
+        "FROM mrr_movements FINAL "
+        "WHERE merchant_id = {mid:String} "
+        "GROUP BY razorpay_sub_id "
+        "HAVING current_mrr_paise > 0 "
+        "ORDER BY current_mrr_paise DESC "
+        "LIMIT {lim:UInt32}",
+        parameters={"mid": merchant_id, "cutoff": cutoff_days, "lim": limit},
+    )
+    cols = ["razorpay_sub_id", "customer_id", "plan_id", "current_mrr_paise",
+            "peak_mrr_paise", "tenure_months", "has_contraction_90d"]
+    rows = []
+    for row in result.result_rows:
+        d = dict(zip(cols, row))
+        d["current_mrr_paise"] = int(d["current_mrr_paise"])
+        d["peak_mrr_paise"] = int(d["peak_mrr_paise"])
+        d["tenure_months"] = int(d["tenure_months"])
+        d["has_contraction_90d"] = bool(d["has_contraction_90d"])
+        rows.append(d)
+    return rows
+
+
+def mrr_trend_for_forecast(merchant_id: str, months: int = 6) -> list[dict]:
+    """
+    Return the last N months of closing MRR for use in regression-based forecasting.
+    Closing MRR = cumulative sum of all deltas up to and including each month.
+    """
+    result = _ch().query(
+        "SELECT "
+        "    period_month, "
+        "    sum(delta_paise) OVER (ORDER BY period_month ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS closing_mrr_paise "
+        "FROM ("
+        "    SELECT period_month, sum(delta_paise) AS delta_paise "
+        "    FROM mrr_movements FINAL "
+        "    WHERE merchant_id = {mid:String} "
+        "    GROUP BY period_month "
+        "    ORDER BY period_month ASC"
+        ") "
+        "ORDER BY period_month DESC "
+        "LIMIT {lim:UInt32}",
+        parameters={"mid": merchant_id, "lim": months},
+    )
+    rows = []
+    for row in result.result_rows:
+        pm = row[0]
+        month_str = pm.strftime("%Y-%m") if hasattr(pm, "strftime") else str(pm)[:7]
+        rows.append({"month": month_str, "closing_mrr_paise": int(row[1])})
+    # Return in ascending order for regression
+    rows.reverse()
+    return rows

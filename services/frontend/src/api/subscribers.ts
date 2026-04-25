@@ -24,8 +24,27 @@ export interface SubscriberDetail {
   timeline: TimelineEntry[];
 }
 
+export interface RiskScore {
+  razorpay_sub_id: string;
+  customer_id: string;
+  plan_id: string;
+  risk_score: number;
+  risk_label: "high" | "medium" | "low";
+  factors: string[];
+}
+
 export async function fetchSubscriber(token: string, subId: string): Promise<SubscriberDetail> {
   const { data } = await createBearerClient(token).get(`/api/v1/subscribers/${subId}`);
+  return data;
+}
+
+export async function fetchRiskScores(
+  token: string,
+  limit = 50,
+): Promise<{ scores: RiskScore[]; total: number }> {
+  const { data } = await createBearerClient(token).get("/api/v1/subscribers/risk-scores", {
+    params: { limit },
+  });
   return data;
 }
 

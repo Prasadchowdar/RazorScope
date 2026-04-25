@@ -216,7 +216,14 @@ def add_activity(
     lead = postgres.get_crm_lead(merchant_id, lead_id)
     if not lead:
         raise HTTPException(status_code=404, detail="lead not found")
-    return postgres.add_lead_activity(merchant_id, lead_id, body.type, body.body)
+    activity = postgres.add_lead_activity(merchant_id, lead_id, body.type, body.body)
+    # Fire-and-forget: embed the activity note for RAG (best-effort, never blocks)
+    try:
+        from api.embeddings import schedule_embed_activity
+        schedule_embed_activity(merchant_id, lead_id, activity["id"], body.body)
+    except Exception:
+        pass
+    return activity
 
 
 # ── Pipeline (full board snapshot) ───────────────────────────────────────────
