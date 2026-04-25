@@ -8,5 +8,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY api/ ./api/
+COPY seed_demo.py ./seed_demo.py
 
 CMD ["python", "-m", "api.main"]
